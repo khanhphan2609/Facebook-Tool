@@ -265,9 +265,73 @@ def scroll_to_load_posts(page: Page, min_posts_needed: int, max_scrolls: int = 1
     return page.locator('[role="article"]').count()
 
 
-# ---------------------------------------------------------------------------
-# BƯỚC 3: TRÍCH XUẤT DỮ LIỆU BÀI VIẾT TỪ 1 GROUP
-# ---------------------------------------------------------------------------
+def get_post_link_from_article(page: Page, article) -> str | None:
+    """
+    Lấy permalink của bài viết bằng 2 chiến lược theo thứ tự:
+
+    1. Quét tĩnh: tìm thẻ <a> có href chứa /posts/ hoặc /permalink/
+       (nhanh, không cần tương tác, nhưng không phải lúc nào cũng có)
+
+    2. Click nút Bình luận: Facebook luôn đẩy permalink của bài lên URL
+       khi mở comment. Đọc URL sau click -> quay lại trang group.
+       (chậm hơn nhưng đáng tin cậy)
+    """
+    # --- Chiến lược 1: quét href tĩnh ---
+    try:
+        for link in article.locator("a").all():
+            href = link.get_attribute("href") or ""
+            if "/posts/" in href or "/permalink/" in href or "story_fbid" in href:
+                return href
+    except Exception:
+        pass
+
+    # --- Chiến lược 2: click nút Bình luận để lấy URL ---
+    try:
+        group_url = page.url  # lưu lại URL hiện tại để quay về
+
+        # Tìm nút "Bình luận" / "Comment" trong article
+        # Facebook render nút này dưới dạng <a> hoặc <div role="button">
+        # có aria-label chứa "comment" / "bình luận"
+        comment_btn = None
+
+        # Thử tìm theo aria-label (tiếng Anh hoặc tiếng Việt)
+        for selector in [
+            'a[aria-label*="comment" i]',
+            'a[aria-label*="bình luận" i]',
+            'span[aria-label*="comment" i]',
+            'span[aria-label*="bình luận" i]',
+        ]:
+            el = article.locator(selector).first
+            if el.count() > 0:
+                comment_btn = el
+                break
+
+        # Fallback: tìm theo text hiển thị (số + "bình luận" / "comment")
+        if not comment_btn:
+            for link in article.locator("a").all():
+                txt = (link.inner_text(timeout=2000) or "").strip().lower()
+                if "bình luận" in txt or "comment" in txt:
+                    comment_btn = link
+                    break
+
+        if comment_btn:
+            comment_btn.click(timeout=5000)
+            # Đợi URL thay đổi (Facebook navigate tới permalink)
+            page.wait_for_url(
+                lambda url: "/posts/" in url or "/permalink/" in url,
+                timeout=5000,
+            )
+            post_url = page.url
+            # Quay lại trang group
+            page.goto(group_url, wait_until="domcontentloaded", timeout=30_000)
+            human_delay(2, 3)
+            return post_url
+
+    except Exception:
+        pass
+
+    return None
+
 
 def extract_posts_from_group(page: Page, group_url: str, limit: int) -> list:
     """
@@ -288,7 +352,7 @@ def extract_posts_from_group(page: Page, group_url: str, limit: int) -> list:
     # Kiểm tra nếu bị redirect về trang login (session hết hạn)
     if "login" in page.url:
         print("  [CẢNH BÁO] Bị chuyển hướng về trang login!")
-        print("  => Session có thể đã hết hạn. Xóa fb_session.json và đăng nhập lại.")
+        print("  => Session có thể đã hết hạn. Export lại cookies vào data/cookies.txt.")
         return []
 
     # Cuộn để đảm bảo có đủ số bài viết cần lấy trên DOM
@@ -307,17 +371,8 @@ def extract_posts_from_group(page: Page, group_url: str, limit: int) -> list:
         except PWTimeout:
             text_content = ""
 
-        # Tìm link permalink của bài viết (href chứa /posts/ hoặc /permalink/)
-        post_link = None
-        try:
-            for link in article.locator("a").all():
-                href = link.get_attribute("href") or ""
-                if "/posts/" in href or "/permalink/" in href:
-                    post_link = href
-                    break
-        except Exception:
-            pass
-
+        # Lấy permalink (thử tĩnh trước, click comment nếu không tìm được)
+        post_link = get_post_link_from_article(page, article)
         post_id = extract_post_id(post_link)
 
         posts_data.append({
