@@ -42,9 +42,17 @@ import json
 import re
 import time
 import random
+import os
 from pathlib import Path
+from typing import Optional
 # pyrefly: ignore [missing-import]
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(SRC_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -52,10 +60,10 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 # ---------------------------------------------------------------------------
 
 # File cookies đăng nhập Facebook (định dạng Netscape - export từ trình duyệt)
-COOKIES_FILE = "data/cookies.txt"
+COOKIES_FILE = os.path.join(BASE_DIR, "data", "cookies.txt")
 
 # File chứa danh sách Group ID Facebook (mỗi ID 1 dòng, # là comment)
-GROUP_IDS_FILE = "data/groupid.txt"
+GROUP_IDS_FILE = os.path.join(BASE_DIR, "data", "groupid.txt")
 
 FACEBOOK_GROUP_BASE_URL = "https://www.facebook.com/groups/"
 
@@ -63,8 +71,8 @@ FACEBOOK_GROUP_BASE_URL = "https://www.facebook.com/groups/"
 POSTS_PER_GROUP = 10
 
 # Output
-POSTID_FILE = "data/postid.txt"      # danh sách post ID, mỗi dòng 1 ID
-POSTS_JSON_FILE = "data/posts.json"  # dữ liệu đầy đủ để debug/kiểm tra
+POSTID_FILE = os.path.join(BASE_DIR, "data", "postid.txt")
+POSTS_JSON_FILE = os.path.join(BASE_DIR, "data", "posts.json")
 
 # Khoảng nghỉ ngẫu nhiên (giây) giữa các thao tác - giả lập hành vi người thật
 MIN_DELAY = 1.5
@@ -82,7 +90,7 @@ def human_delay(a: float = MIN_DELAY, b: float = MAX_DELAY) -> None:
 
 def ensure_data_dir() -> None:
     """Đảm bảo thư mục data/ tồn tại (tạo nếu chưa có)."""
-    Path("data").mkdir(parents=True, exist_ok=True)
+    os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
 
 
 def load_group_urls(filepath: str = GROUP_IDS_FILE) -> list:
@@ -92,14 +100,13 @@ def load_group_urls(filepath: str = GROUP_IDS_FILE) -> list:
     - Bỏ qua dòng trống và dòng bắt đầu bằng #
     - URL được tự ghép: https://www.facebook.com/groups/{group_id}
     """
-    path = Path(filepath)
-    if not path.exists():
+    if not os.path.exists(filepath):
         print(f"[LỖI] Không tìm thấy file: {filepath}")
         print( "      Hãy thêm Group ID vào file (định dạng: mỗi dòng 1 ID số).")
         return []
 
     urls = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             group_id = line.strip()
             if group_id and not group_id.startswith("#"):
@@ -207,8 +214,7 @@ def load_cookies_from_txt(filepath: str = COOKIES_FILE) -> list:
 
     Dòng bắt đầu bằng # hoặc rỗng -> bỏ qua.
     """
-    path = Path(filepath)
-    if not path.exists():
+    if not os.path.exists(filepath):
         raise FileNotFoundError(
             f"Không tìm thấy file cookies: {filepath}\n"
             f"Hãy dán chuỗi cookies Facebook vào file này.\n"
@@ -216,7 +222,7 @@ def load_cookies_from_txt(filepath: str = COOKIES_FILE) -> list:
         )
 
     cookies = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -267,68 +273,29 @@ def scroll_to_load_posts(page: Page, min_posts_needed: int, max_scrolls: int = 1
 
 def get_post_link_from_article(page: Page, article) -> str | None:
     """
-    Lấy permalink của bài viết bằng 2 chiến lược theo thứ tự:
-
-    1. Quét tĩnh: tìm thẻ <a> có href chứa /posts/ hoặc /permalink/
-       (nhanh, không cần tương tác, nhưng không phải lúc nào cũng có)
-
-    2. Click nút Bình luận: Facebook luôn đẩy permalink của bài lên URL
-       khi mở comment. Đọc URL sau click -> quay lại trang group.
-       (chậm hơn nhưng đáng tin cậy)
+    Lấy permalink của bài viết bằng cách quét toàn bộ thẻ <a> bên trong bài.
+    Trên Facebook, thẻ hiển thị thời gian (vd "2 giờ", "Hôm qua") luôn là 1 thẻ <a> trỏ thẳng tới permalink của bài viết.
+    Chúng ta chỉ cần tìm thẻ <a> nào có href chứa định dạng Post ID là thành công, KHÔNG CẦN CLICK.
     """
-    # --- Chiến lược 1: quét href tĩnh ---
     try:
-        for link in article.locator("a").all():
-            href = link.get_attribute("href") or ""
-            if "/posts/" in href or "/permalink/" in href or "story_fbid" in href:
+        links = article.locator("a").all()
+        for link in links:
+            href = link.get_attribute("href")
+            if not href:
+                continue
+                
+            # Đảm bảo URL đầy đủ
+            if href.startswith("/"):
+                href = "https://www.facebook.com" + href
+                
+            # Kiểm tra xem href này có chứa Post ID hợp lệ không
+            post_id = extract_post_id(href)
+            if post_id:
+                # Tìm thấy permalink chứa ID, trả về luôn
                 return href
-    except Exception:
-        pass
-
-    # --- Chiến lược 2: click nút Bình luận để lấy URL ---
-    try:
-        group_url = page.url  # lưu lại URL hiện tại để quay về
-
-        # Tìm nút "Bình luận" / "Comment" trong article
-        # Facebook render nút này dưới dạng <a> hoặc <div role="button">
-        # có aria-label chứa "comment" / "bình luận"
-        comment_btn = None
-
-        # Thử tìm theo aria-label (tiếng Anh hoặc tiếng Việt)
-        for selector in [
-            'a[aria-label*="comment" i]',
-            'a[aria-label*="bình luận" i]',
-            'span[aria-label*="comment" i]',
-            'span[aria-label*="bình luận" i]',
-        ]:
-            el = article.locator(selector).first
-            if el.count() > 0:
-                comment_btn = el
-                break
-
-        # Fallback: tìm theo text hiển thị (số + "bình luận" / "comment")
-        if not comment_btn:
-            for link in article.locator("a").all():
-                txt = (link.inner_text(timeout=2000) or "").strip().lower()
-                if "bình luận" in txt or "comment" in txt:
-                    comment_btn = link
-                    break
-
-        if comment_btn:
-            comment_btn.click(timeout=5000)
-            # Đợi URL thay đổi (Facebook navigate tới permalink)
-            page.wait_for_url(
-                lambda url: "/posts/" in url or "/permalink/" in url,
-                timeout=5000,
-            )
-            post_url = page.url
-            # Quay lại trang group
-            page.goto(group_url, wait_until="domcontentloaded", timeout=30_000)
-            human_delay(2, 3)
-            return post_url
-
-    except Exception:
-        pass
+                
+    except Exception as e:
+        print(f"      [LỖI] khi quét tìm permalink trong bài viết: {e}")
 
     return None
 
@@ -364,6 +331,14 @@ def extract_posts_from_group(page: Page, group_url: str, limit: int) -> list:
 
     for i in range(min(limit, total_found)):
         article = articles.nth(i)
+        
+        # BẮT BUỘC: Phải scroll tới bài viết để Facebook (React) render lại DOM 
+        # (nếu không, bài viết ở xa bị ẩn đi sẽ không có thẻ <a>)
+        try:
+            article.scroll_into_view_if_needed(timeout=2000)
+            human_delay(1, 2)
+        except:
+            pass
 
         # Lấy toàn bộ text hiển thị của bài viết
         try:
@@ -384,9 +359,9 @@ def extract_posts_from_group(page: Page, group_url: str, limit: int) -> list:
         })
 
         if post_id:
-            print(f"  [{i + 1}] post_id={post_id}")
+            print(f"  [{i + 1}] Lấy thành công: post_id={post_id} (URL: {post_link})")
         else:
-            print(f"  [{i + 1}] Không lấy được post_id (link: {post_link})")
+            print(f"  [{i + 1}] LỖI: Không tìm thấy link/ID bài viết. URL sau khi click: {post_link}")
 
     return posts_data
 
@@ -403,26 +378,21 @@ def save_results(all_posts: list) -> None:
     """
     ensure_data_dir()
 
-    # Gom tất cả post_id hợp lệ (không None, không trùng trong lần chạy này)
-    seen = set()
-    post_ids = []
-    for post in all_posts:
-        pid = post.get("post_id")
-        if pid and pid not in seen:
-            seen.add(pid)
-            post_ids.append(pid)
+    # 1. Ghi thêm post_id vào postid.txt
+    valid_ids = [p["post_id"] for p in all_posts if p.get("post_id")]
+    if valid_ids:
+        # Sử dụng set để tránh duplicate trong cùng lần chạy
+        unique_ids = sorted(list(set(valid_ids)), key=valid_ids.index)
+        with open(POSTID_FILE, "a", encoding="utf-8") as f:
+            for pid in unique_ids:
+                f.write(pid + "\n")
+        print(f"\nĐã lưu {len(unique_ids)} post ID vào {POSTID_FILE}")
 
-    # Ghi file post ID - append để không mất dữ liệu các lần chạy trước
-    with open(POSTID_FILE, "a", encoding="utf-8") as f:
-        for pid in post_ids:
-            f.write(pid + "\n")
-
-    # Ghi file JSON đầy đủ (overwrite - chỉ giữ lần chạy gần nhất)
-    with open(POSTS_JSON_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_posts, f, ensure_ascii=False, indent=2)
-
-    print(f"\nĐã lưu {len(post_ids)} post ID vào {POSTID_FILE}")
-    print(f"Đã lưu dữ liệu đầy đủ vào {POSTS_JSON_FILE}")
+    # 2. Ghi đè chi tiết vào posts.json
+    if all_posts:
+        with open(POSTS_JSON_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_posts, f, ensure_ascii=False, indent=4)
+        print(f"Đã lưu dữ liệu đầy đủ vào {POSTS_JSON_FILE}")
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +423,10 @@ def scrape_all_groups() -> None:
     with sync_playwright() as p:
         # headless=False: giảm nguy cơ bị Facebook phát hiện là bot
         browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
 
         # Nạp cookies vào context -> truy cập FB như đã đăng nhập
         apply_cookies(context, cookies)
