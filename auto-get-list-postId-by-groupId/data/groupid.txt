@@ -1,0 +1,13 @@
+# Danh sách ID Group Facebook cần lấy bài viết
+# Mỗi ID trên một dòng
+# Dòng bắt đầu bằng # là comment, sẽ bị bỏ qua
+# Dòng trống cũng bị bỏ qua
+
+2450244075069818
+776506469800802
+258940354514985
+565805780112322
+2634945416642081
+
+
+# Thêm các group khác bên dưới
